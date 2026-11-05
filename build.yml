@@ -1,0 +1,20 @@
+name: Build exe
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Compilar
+        run: |
+          GOOS=windows GOARCH=amd64 go build -ldflags "-s -w" -o MiniLauncher-64bit.exe .
+          GOOS=windows GOARCH=386 go build -ldflags "-s -w" -o MiniLauncher-32bit.exe .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MiniLauncher
+          path: "*.exe"
