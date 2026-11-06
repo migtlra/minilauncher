@@ -4,6 +4,7 @@ package main
 
 import (
 	"archive/zip"
+	"context"
 	"bufio"
 	"crypto/md5"
 	"crypto/sha1"
@@ -14,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -44,7 +47,7 @@ type Ver struct {
 	URL  string
 }
 
-var client = &http.Client{Transport: newTransport(false), Timeout: 15 * time.Minute}
+var client = &http.Client{Transport: newTransport(false)}
 var tlsMu sync.Mutex
 var insecure bool
 
@@ -114,8 +117,36 @@ func is64() bool {
 
 // ---------- rede ----------
 
-func httpGet(url string) (*http.Response, error) {
-	resp, err := client.Get(url)
+const idleLimit = 45 * time.Second
+
+// idleReader renova o prazo a cada leitura: so cancela se o download ficar parado.
+type idleReader struct {
+	r io.Reader
+	t *time.Timer
+}
+
+func (i *idleReader) Read(p []byte) (int, error) {
+	n, err := i.r.Read(p)
+	i.t.Reset(idleLimit)
+	return n, err
+}
+
+func idleCtx() (context.Context, *time.Timer, func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t := time.AfterFunc(idleLimit, cancel)
+	return ctx, t, func() {
+		t.Stop()
+		cancel()
+	}
+}
+
+func httpGet(ctx context.Context, url string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "MiniLauncher/2.0 (launcher leve)")
+	resp, err := client.Do(req)
 	if err != nil && strings.Contains(err.Error(), "x509") {
 		tlsMu.Lock()
 		if !insecure {
@@ -124,13 +155,15 @@ func httpGet(url string) (*http.Response, error) {
 			fmt.Println("AVISO: certificados do sistema nao reconhecidos; seguindo sem verificar TLS (arquivos conferidos por SHA1).")
 		}
 		tlsMu.Unlock()
-		resp, err = client.Get(url)
+		resp, err = client.Do(req)
 	}
 	return resp, err
 }
 
 func getBytes(url string) ([]byte, error) {
-	resp, err := httpGet(url)
+	ctx, t, done := idleCtx()
+	defer done()
+	resp, err := httpGet(ctx, url)
 	if err != nil {
 		return nil, err
 	}
@@ -138,7 +171,7 @@ func getBytes(url string) ([]byte, error) {
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("HTTP %d em %s", resp.StatusCode, url)
 	}
-	return io.ReadAll(resp.Body)
+	return io.ReadAll(&idleReader{resp.Body, t})
 }
 
 func getJSON(url string) (M, error) {
@@ -162,7 +195,9 @@ func readJSON(path string) (M, error) {
 }
 
 func fetchTo(url, dest, sum string) error {
-	resp, err := httpGet(url)
+	ctx, t, done := idleCtx()
+	defer done()
+	resp, err := httpGet(ctx, url)
 	if err != nil {
 		return err
 	}
@@ -175,7 +210,7 @@ func fetchTo(url, dest, sum string) error {
 		return err
 	}
 	h := sha1.New()
-	_, err = io.Copy(io.MultiWriter(f, h), resp.Body)
+	_, err = io.Copy(io.MultiWriter(f, h), &idleReader{resp.Body, t})
 	f.Close()
 	if err != nil {
 		return err
@@ -234,9 +269,7 @@ func downloadAll(jobs []Job) error {
 					mu.Unlock()
 				}
 				n := atomic.AddInt32(&done, 1)
-				if n%20 == 0 || int(n) == total {
-					fmt.Printf("\r  %d/%d arquivos", n, total)
-				}
+				fmt.Printf("\r  %d/%d arquivos   ", n, total)
 			}
 		}()
 	}
@@ -450,9 +483,239 @@ func tail(path string, n int) {
 	}
 }
 
+// ---------- modo otimizado: Fabric + mods de desempenho ----------
+
+// Niveis cumulativos: 1 = seguro, 2 = forte, 3 = maximo. "a|b" = tenta a, senao b.
+var modTiers = [][]string{
+	{},
+	{"sodium", "lithium", "ferrite-core", "modernfix", "entityculling", "immediatelyfast"},
+	{"moreculling", "sodium-extra", "dynamic-fps", "memoryleakfix", "badoptimizations", "krypton", "fastquit", "fast-ip-ping", "cull-leaves", "smoothboot-reloaded", "scalablelux|starlight"},
+	{"c2me-fabric", "noisium"},
+}
+
+func modsForLevel(n int) []string {
+	var out []string
+	for i := 1; i <= n && i < len(modTiers); i++ {
+		out = append(out, modTiers[i]...)
+	}
+	return out
+}
+
+type loaderDef struct {
+	name  string
+	meta  string
+	maven string
+}
+
+// Fabric normal (1.14+) e Legacy Fabric (versoes antigas, ate 1.13.2).
+var loaderDefs = []loaderDef{
+	{"fabric", "https://meta.fabricmc.net/v2", "https://maven.fabricmc.net/"},
+	{"legacy-fabric", "https://meta.legacyfabric.net/v2", "https://maven.legacyfabric.net/"},
+}
+
+var errCrash = errors.New("o jogo fechou logo apos abrir")
+var latestRelease string
+
+func mavenPath(name string) (string, bool) {
+	p := strings.Split(name, ":")
+	if len(p) < 3 {
+		return "", false
+	}
+	file := p[1] + "-" + p[2]
+	if len(p) > 3 {
+		file += "-" + p[3]
+	}
+	return strings.Replace(p[0], ".", "/", -1) + "/" + p[1] + "/" + p[2] + "/" + file + ".jar", true
+}
+
+// applyFabric junta o perfil do Fabric Loader ao JSON da versao (se a versao for suportada).
+func applyFabric(vdir, id string, ver M, ld loaderDef) error {
+	cache := filepath.Join(vdir, ld.name+"-profile.json")
+	var fp M
+	if fileExists(cache) {
+		if m, err := readJSON(cache); err == nil {
+			fp = m
+		}
+	}
+	if fp == nil {
+		list, err := getBytes(ld.meta + "/versions/loader/" + neturl.PathEscape(id))
+		if err != nil {
+			return err
+		}
+		var arr []interface{}
+		if err := json.Unmarshal(list, &arr); err != nil {
+			return err
+		}
+		if len(arr) == 0 {
+			return errors.New(ld.name + " nao suporta a versao " + id)
+		}
+		lv := ""
+		for _, it := range arr {
+			l := asM(asM(it)["loader"])
+			if asB(l["stable"]) {
+				lv = asS(l["version"])
+				break
+			}
+		}
+		if lv == "" {
+			lv = asS(asM(asM(arr[0])["loader"])["version"])
+		}
+		b, err := getBytes(ld.meta + "/versions/loader/" + neturl.PathEscape(id) + "/" + neturl.PathEscape(lv) + "/profile/json")
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(b, &fp); err != nil {
+			return err
+		}
+		os.WriteFile(cache, b, 0644)
+	}
+	if asS(fp["mainClass"]) == "" {
+		return errors.New("perfil Fabric invalido")
+	}
+	ver["mainClass"] = fp["mainClass"]
+	libs := asL(ver["libraries"])
+	for _, lo := range asL(fp["libraries"]) {
+		l := asM(lo)
+		p, ok := mavenPath(asS(l["name"]))
+		if !ok {
+			continue
+		}
+		base := asS(l["url"])
+		if base == "" {
+			base = ld.maven
+		}
+		if !strings.HasSuffix(base, "/") {
+			base += "/"
+		}
+		art := M{"path": p, "url": base + p, "sha1": asS(l["sha1"]), "size": float64(asN(l["size"]))}
+		libs = append(libs, M{"downloads": M{"artifact": art}})
+	}
+	ver["libraries"] = libs
+	if fa := asM(fp["arguments"]); fa != nil {
+		a := asM(ver["arguments"])
+		if a == nil {
+			var g []interface{}
+			for _, t := range strings.Fields(asS(ver["minecraftArguments"])) {
+				g = append(g, t)
+			}
+			a = M{"jvm": []interface{}{"-Djava.library.path=${natives_directory}", "-cp", "${classpath}"}, "game": g}
+			ver["arguments"] = a
+		}
+		a["jvm"] = append(asL(a["jvm"]), asL(fa["jvm"])...)
+		a["game"] = append(asL(a["game"]), asL(fa["game"])...)
+	}
+	return nil
+}
+
+func modrinthLatest(proj, game string) (M, error) {
+	q := neturl.Values{}
+	q.Set("loaders", `["fabric"]`)
+	q.Set("game_versions", `["`+game+`"]`)
+	b, err := getBytes("https://api.modrinth.com/v2/project/" + neturl.PathEscape(proj) + "/version?" + q.Encode())
+	if err != nil {
+		return nil, err
+	}
+	var arr []interface{}
+	if err := json.Unmarshal(b, &arr); err != nil {
+		return nil, err
+	}
+	var first M
+	for _, it := range arr {
+		m := asM(it)
+		if m == nil {
+			continue
+		}
+		if first == nil {
+			first = m
+		}
+		if asS(m["version_type"]) == "release" {
+			return m, nil
+		}
+	}
+	if first == nil {
+		return nil, errors.New("sem versao para " + game)
+	}
+	return first, nil
+}
+
+// collectMods resolve cada mod (e suas dependencias obrigatorias) no Modrinth.
+func collectMods(game, modsDir string, slugs []string) []Job {
+	var jobs []Job
+	seen := map[string]bool{}
+	var add func(proj string, depth int) bool
+	add = func(proj string, depth int) bool {
+		v, err := modrinthLatest(proj, game)
+		if err != nil {
+			fmt.Printf("  - %s: %v (ignorado)\n", proj, err)
+			return false
+		}
+		pid := asS(v["project_id"])
+		if seen[pid] {
+			return true
+		}
+		seen[pid] = true
+		var f M
+		for _, fo := range asL(v["files"]) {
+			fm := asM(fo)
+			if f == nil {
+				f = fm
+			}
+			if asB(fm["primary"]) {
+				f = fm
+			}
+		}
+		if f == nil {
+			return false
+		}
+		name := filepath.Base(asS(f["filename"]))
+		jobs = append(jobs, Job{URL: asS(f["url"]), Dest: filepath.Join(modsDir, name), SHA1: asS(asM(f["hashes"])["sha1"]), Size: asN(f["size"])})
+		fmt.Println("  + " + proj)
+		if depth < 3 {
+			for _, d := range asL(v["dependencies"]) {
+				dm := asM(d)
+				if asS(dm["dependency_type"]) == "required" && asS(dm["project_id"]) != "" {
+					add(asS(dm["project_id"]), depth+1)
+				}
+			}
+		}
+		return true
+	}
+	for _, sl := range slugs {
+		for _, alt := range strings.Split(sl, "|") {
+			if add(alt, 0) {
+				break
+			}
+		}
+	}
+	return jobs
+}
+
+// cleanOldMods remove mods que o launcher instalou antes e que nao fazem mais parte da lista.
+func cleanOldMods(dir string, jobs []Job) {
+	keep := map[string]bool{}
+	for _, j := range jobs {
+		keep[filepath.Base(j.Dest)] = true
+	}
+	listPath := filepath.Join(dir, ".gerenciados")
+	if b, err := os.ReadFile(listPath); err == nil {
+		for _, name := range strings.Split(string(b), "\n") {
+			name = strings.TrimSpace(name)
+			if name != "" && !keep[name] {
+				os.Remove(filepath.Join(dir, name))
+			}
+		}
+	}
+	var names []string
+	for n := range keep {
+		names = append(names, n)
+	}
+	os.WriteFile(listPath, []byte(strings.Join(names, "\n")), 0644)
+}
+
 // ---------- lancamento ----------
 
-func launch(base, dados string, v *Ver, nome string, ram int, semSom bool) error {
+func launch(base, dados string, v *Ver, nome string, ram int, semSom bool, nivel int) error {
+	otim := nivel > 0
 	nome = regexp.MustCompile(`[^A-Za-z0-9_]`).ReplaceAllString(nome, "")
 	if len(nome) < 3 {
 		nome = "Jogador"
@@ -470,7 +733,7 @@ func launch(base, dados string, v *Ver, nome string, ram int, semSom bool) error
 	vdir := filepath.Join(dados, "versoes", v.ID)
 	natives := filepath.Join(vdir, "natives")
 	jogo := filepath.Join(dados, "jogo", v.ID)
-	for _, d := range []string{vdir, natives, jogo} {
+	for _, d := range []string{vdir, natives} {
 		os.MkdirAll(d, 0755)
 	}
 
@@ -489,6 +752,38 @@ func launch(base, dados string, v *Ver, nome string, ram int, semSom bool) error
 	ver, err := readJSON(vjson)
 	if err != nil {
 		return err
+	}
+
+	modernOpts := asM(ver["arguments"]) != nil
+
+	// Modo otimizado: Fabric (ou Legacy Fabric) + mods de desempenho, se a versao for suportada
+	if otim {
+		applied := false
+		for _, ld := range loaderDefs {
+			fmt.Printf("Otimizacao nivel %d: preparando %s...\n", nivel, ld.name)
+			err := applyFabric(vdir, v.ID, ver, ld)
+			if err == nil {
+				applied = true
+				break
+			}
+			fmt.Println("  " + ld.name + " indisponivel: " + err.Error())
+		}
+		if !applied {
+			fmt.Println("Nenhum loader suporta esta versao. Abrindo a versao normal.")
+			otim = false
+		}
+	}
+	if otim {
+		jogo = jogo + "-otimizado"
+	}
+	os.MkdirAll(jogo, 0755)
+	var modJobs []Job
+	if otim {
+		fmt.Println("Procurando mods de desempenho (Modrinth)...")
+		modsDir := filepath.Join(jogo, "mods")
+		os.MkdirAll(modsDir, 0755)
+		modJobs = collectMods(v.ID, modsDir, modsForLevel(nivel))
+		cleanOldMods(modsDir, modJobs)
 	}
 
 	// 2. Java
@@ -568,7 +863,8 @@ func launch(base, dados string, v *Ver, nome string, ram int, semSom bool) error
 		jobs = append(jobs, Job{URL: asS(ai["url"]), Dest: idxPath, SHA1: asS(ai["sha1"]), Size: asN(ai["size"])})
 	}
 
-	fmt.Println("Baixando jogo e bibliotecas...")
+	jobs = append(jobs, modJobs...)
+	fmt.Println("Baixando jogo, bibliotecas e mods...")
 	if err := downloadAll(jobs); err != nil {
 		return err
 	}
@@ -635,7 +931,11 @@ func launch(base, dados string, v *Ver, nome string, ram int, semSom bool) error
 	// 6. Opcoes de video minimas (so se ainda nao existirem)
 	opt := filepath.Join(jogo, "options.txt")
 	if !fileExists(opt) {
-		os.WriteFile(opt, []byte("renderDistance:2\nparticles:2\nfancyGraphics:false\ngraphicsMode:0\nenableVsync:false\nmaxFps:40\nmipmapLevels:0\nentityShadows:false\nviewBobbing:false\n"), 0644)
+		txt := "renderDistance:2\nparticles:2\nfancyGraphics:false\ngraphicsMode:0\nenableVsync:false\nmaxFps:40\nmipmapLevels:0\nentityShadows:false\nviewBobbing:false\n"
+		if modernOpts {
+			txt = "renderDistance:4\nsimulationDistance:5\nparticles:2\ngraphicsMode:0\nao:false\nenableVsync:false\nmaxFps:60\nmipmapLevels:0\nbiomeBlendRadius:0\nentityShadows:false\nentityDistanceScaling:0.5\nviewBobbing:false\nrenderClouds:\"false\"\n"
+		}
+		os.WriteFile(opt, []byte(txt), 0644)
 	}
 
 	// 7. UUID offline
@@ -692,10 +992,14 @@ func launch(base, dados string, v *Ver, nome string, ram int, semSom bool) error
 	}
 
 	cmdArgs := []string{
+		"-XX:+IgnoreUnrecognizedVMOptions",
 		fmt.Sprintf("-Xmx%dM", ram),
 		fmt.Sprintf("-Xms%dM", minInt(ram, 256)),
 		"-XX:+UseSerialGC",
 		"-XX:TieredStopAtLevel=1",
+		"-XX:ReservedCodeCacheSize=64m",
+		"-XX:-UseBiasedLocking",
+		"-Djava.net.preferIPv4Stack=true",
 		"-Dfile.encoding=UTF-8",
 		"-Dlog4j2.formatMsgNoLookups=true",
 	}
@@ -727,12 +1031,17 @@ func launch(base, dados string, v *Ver, nome string, ram int, semSom bool) error
 	cmd.Dir = jogo
 	cmd.Stdout = lf
 	cmd.Stderr = lf
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x00008000} // prioridade acima do normal
+	start := time.Now()
 	fmt.Printf("Iniciando %s (Java %d, %d MB)...\n", v.ID, major, ram)
 	if err := cmd.Start(); err != nil {
 		return err
 	}
 	if err := cmd.Wait(); err != nil {
 		tail(logPath, 15)
+		if otim && time.Since(start) < 120*time.Second {
+			return fmt.Errorf("%w (%v); log em %s", errCrash, err, logPath)
+		}
 		return fmt.Errorf("o jogo fechou com erro: %v (log completo em %s)", err, logPath)
 	}
 	return nil
@@ -753,6 +1062,7 @@ func loadVersions(dados string) ([]Ver, error) {
 			return nil, errors.New("sem internet e sem lista de versoes salva")
 		}
 	}
+	latestRelease = asS(asM(m["latest"])["release"])
 	var out []Ver
 	for _, v := range asL(m["versions"]) {
 		d := asM(v)
@@ -828,12 +1138,16 @@ func run() int {
 
 	for {
 		if id == "" {
-			id = ask("Versao (ex 1.8.9) ou 'lista'", "1.8.9")
+			id = ask("Versao (ex 1.8.9), 'ultima' ou 'lista'", "1.8.9")
 		}
 		if strings.EqualFold(id, "lista") {
 			printList(vers, ask)
 			id = ""
 			continue
+		}
+		if strings.EqualFold(id, "ultima") && latestRelease != "" {
+			id = latestRelease
+			fmt.Println("Ultima versao:", id)
 		}
 		if findVer(vers, id) != nil {
 			break
@@ -856,11 +1170,31 @@ func run() int {
 		semSom = strings.HasPrefix(strings.ToLower(ask("Pular sons para baixar menos? (s/n)", "n")), "s")
 	}
 
-	if err := launch(base, dados, findVer(vers, id), nome, ram, semSom); err != nil {
+	nivel := 0
+	if len(args) == 0 {
+		n := ask("Otimizacao: 0=nenhuma 1=segura 2=forte 3=maxima", "3")
+		if x, e := strconv.Atoi(n); e == nil && x >= 0 && x <= 3 {
+			nivel = x
+		} else {
+			nivel = 3
+		}
+	} else if contains(args, "otimizado") {
+		nivel = 3
+	}
+
+	for {
+		err := launch(base, dados, findVer(vers, id), nome, ram, semSom, nivel)
+		if err == nil {
+			return 0
+		}
+		if errors.Is(err, errCrash) && nivel > 1 {
+			nivel--
+			fmt.Printf("\nO jogo fechou com erro. Tentando de novo com menos mods (nivel %d)...\n\n", nivel)
+			continue
+		}
 		fmt.Println("\nERRO:", err)
 		return 1
 	}
-	return 0
 }
 
 func main() {
